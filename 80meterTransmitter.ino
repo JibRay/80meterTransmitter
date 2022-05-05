@@ -1,7 +1,7 @@
 // 80meterTransmitter.ino
 // This is a merge of iambicToneGenerator and localOscillator. It performs two
 // transitter front-end functions: iambic key input and local oscillator
-// frequency control.
+// frequency control. FIXME: this could be devided in to header files.
 //
 /*
 Iambic key:
@@ -41,10 +41,10 @@ Iambic key:
 
  Local Oscillator:
   Local oscillator commands set the frequency of the SI5351 device via
-  the I2C interface.
+  the I2C interface using the Adafruit SI5351 library.
  */
 
-// Started by installing Adafruit Si5351 library. The
+// Started by installing Adafruit Si5351 library.
 #include <Adafruit_SI5351.h>
 
 //============================================================================
@@ -87,24 +87,27 @@ Iambic key:
 #define CMD_ARGUMENT  1
 
 // Argument states.
-#define BUFFER_SIZE    80
-#define S_COMMAND       1
-#define C_VERSION       1
-#define C_HELP          2
-#define C_SET_FREQUENCY 3
-#define C_PRINT_ID      4
+#define BUFFER_SIZE     80
+#define S_COMMAND        1
+#define C_VERSION        1
+#define C_HELP           2
+#define C_SET_WORD_SPEED 3
+#define C_SET_FREQUENCY  4
+#define C_KEY_ENABLE     5
+#define C_PRINT_ID       6
 
 //============================================================================
 // Globals
 
-const int version = 2;
+const int version = 3;
 Adafruit_SI5351 clockgen = Adafruit_SI5351();
 char lineBuffer[BUFFER_SIZE];
 int bufferIndex, mainState, commandState;
 uint32_t LOfrequency;
 int toneFrequency;
 int keyState, toneState, lastTone, toneType;
-unsigned long toneTimer, wordTime, ditTime, dahTime;
+unsigned long toneTimer, ditTime, dahTime;
+bool keyEnabled = false;
 
 //============================================================================
 // Global functions
@@ -120,18 +123,70 @@ void printVersion() {
   Serial.println(version);
 }
 
+// Set the local oscillator frequency.
+void setFrequency(float f) {
+//  float f = atof(lineBuffer);
+  LOfrequency = (uint32_t)(f * 1e6);
+  if ((LOfrequency >= 3500000) && (LOfrequency <= 4000000)) {
+    Serial.print(F("Frequency set to "));
+    Serial.println(LOfrequency);
+    // Set PLL_B to 900 MHz.
+    clockgen.setupPLL(SI5351_PLL_B, 36, 0, 1);
+    float denominator = 25000000.0 * 36.0 / LOfrequency;
+    uint32_t m1 = (uint32_t)denominator;
+    uint32_t m2 = (uint32_t)(1000.0 * (denominator - (float)m1));
+    clockgen.setupMultisynth(1, SI5351_PLL_B, m1, m2, 1000);
+  } else {
+    Serial.print(F("Error: invalid fequency = "));
+    Serial.println(LOfrequency);
+  }
+}
+
+void setKeyEnable(int state) {
+  keyEnabled = state == 1;
+  keyOutput(!keyEnabled);
+}
+
 // speed argument is words per minute.
 void setWordSpeed(int speed) {
-  unsigned long wordTime = (unsigned long)(60.0 / (float)speed);
-  ditTime = (unsigned long)(1000.0 * (float)wordTime / 50.0);
-  dahTime = (unsigned long)((float)ditTime * 3.0);
+  if ((speed >= 5) && (speed <= 25)) {
+    Serial.print(F("Word speed set to "));
+    Serial.println(speed);
+    unsigned long wordTime = (unsigned long)(60.0 / (float)speed);
+    ditTime = (unsigned long)(1000.0 * (float)wordTime / 50.0);
+    dahTime = (unsigned long)((float)ditTime * 3.0);
+  } else {
+    Serial.print(F("Word speed of "));
+    Serial.print(speed);
+    Serial.println(F(" is out of range"));
+  }
+}
+
+void setCommandState(int newState) {
+    commandState = newState;
+    mainState = S_COMMAND;
+    clearBuffer();
+}
+
+// Turn the key tone on or off. If keyEnabled is true, also switch the
+// local oscillator output on or off. If keyEnabled is false, the
+// oscillator output is on all the time.
+void keyOutput(bool on) {
+  if (on) {
+    tone(TONE_PIN, TONE_FREQ);
+    clockgen.enableOutputs(true);
+  } else {
+    noTone(TONE_PIN);
+    if (keyEnabled)
+      clockgen.enableOutputs(false);
+  }
 }
 
 // Update the state of the iambic key state machine.
 void updateKeyState() {
   bool ditKeyInput = digitalRead(DIT_PIN) == LOW;
   // debug
-  digitalWrite(LED_PIN, ditKeyInput);
+  // digitalWrite(LED_PIN, ditKeyInput);
   // debug
   bool dahKeyInput = digitalRead(DAH_PIN) == LOW;
   
@@ -194,15 +249,15 @@ bool updateToneState(int toneType) {
       switch (toneType) {
         case DIT:
         case DIT_DAH:
-          toneTimer = millis() + DIT_TIME;
-          tone(TONE_PIN, TONE_FREQ);
+          toneTimer = millis() + ditTime;
+          keyOutput(true);
           lastTone = DIT;
           toneState = TONE_ON;
           break;
         case DAH:
         case DAH_DIT:
-          toneTimer = millis() + DAH_TIME;
-          tone(TONE_PIN, TONE_FREQ);
+          toneTimer = millis() + dahTime;
+          keyOutput(true);
           lastTone = DAH;
           toneState = TONE_ON;
           break;
@@ -210,8 +265,8 @@ bool updateToneState(int toneType) {
       break;
     case TONE_ON:
       if (millis() > toneTimer) {
-        noTone(TONE_PIN);
-        toneTimer = millis() + DIT_TIME;
+        keyOutput(false);
+        toneTimer = millis() + ditTime;
         toneState = TONE_PAUSE;
       }
       break;
@@ -228,13 +283,13 @@ bool updateToneState(int toneType) {
           case DIT_DAH:
           case DAH_DIT:
             if (DIT == lastTone) {
-              toneTimer = millis() + DAH_TIME;
-              tone(TONE_PIN, TONE_FREQ);
+              toneTimer = millis() + dahTime;
+              keyOutput(true);
               lastTone = DAH;
               toneState = TONE_ON;
             } else {
-              toneTimer = millis() + DIT_TIME;
-              tone(TONE_PIN, TONE_FREQ);
+              toneTimer = millis() + ditTime;
+              keyOutput(true);
               lastTone = DIT;
               toneState = TONE_ON;
             }
@@ -246,33 +301,31 @@ bool updateToneState(int toneType) {
   return done;
 }
 
-// Update the local oscillator frequency state machine.
-void updateOscillatorState() {
+// Process commands arriving via the serial port.
+void updateMainState() {
   if (Serial.available() > 0) {
     char c = Serial.read();
     switch (mainState) {
       case IDLE_STATE:
         switch (c) {
           case 'v':
-            commandState = C_VERSION;
-            mainState = S_COMMAND;
-            clearBuffer();
+            setCommandState(C_VERSION);
             break;
           case 'h':
-            commandState = C_HELP;
-            mainState = S_COMMAND;
-            clearBuffer();
+            setCommandState(C_HELP);
             break;
           case 'f':
-            commandState = C_SET_FREQUENCY;
-            mainState = S_COMMAND;
-            clearBuffer();
+            setCommandState(C_SET_FREQUENCY);
+            break;
+          case 'k':
+            setCommandState(C_KEY_ENABLE);
+            break;
+          case 'w':
+            setCommandState(C_SET_WORD_SPEED);
             break;
           case '@':
             Serial.print(F("Local Oscillator"));
-            commandState = C_PRINT_ID;
-            mainState = S_COMMAND;
-            clearBuffer();
+            setCommandState(C_PRINT_ID);
             break;
         }
         break;
@@ -301,6 +354,24 @@ void updateOscillatorState() {
               lineBuffer[bufferIndex++] = c;
             }
             break;
+          case C_KEY_ENABLE:
+            if (c == '\n' || c == '\r') {
+              setKeyEnable(atoi(lineBuffer));
+              commandState = IDLE_STATE;
+              mainState = IDLE_STATE;
+            } else {
+              lineBuffer[bufferIndex++] = c;
+            }
+            break;
+          case C_SET_WORD_SPEED:
+            if (c == '\n' || c == '\r') {
+              setWordSpeed(atoi(lineBuffer));
+              commandState = IDLE_STATE;
+              mainState = IDLE_STATE;
+            } else {
+              lineBuffer[bufferIndex++] = c;
+            }
+            break;
           case C_PRINT_ID:
             if (c == '\n' || c == '\r') {
               Serial.println();
@@ -314,25 +385,6 @@ void updateOscillatorState() {
   }
 }
 
-// Set the local oscillator frequency.
-void setFrequency(float f) {
-//  float f = atof(lineBuffer);
-  LOfrequency = (uint32_t)(f * 1e6);
-  if ((LOfrequency >= 3500000) && (LOfrequency <= 4000000)) {
-    Serial.print(F("Frequency set to "));
-    Serial.println(LOfrequency);
-    // Set PLL_B to 900 MHz.
-    clockgen.setupPLL(SI5351_PLL_B, 36, 0, 1);
-    float denominator = 25000000.0 * 36.0 / LOfrequency;
-    uint32_t m1 = (uint32_t)denominator;
-    uint32_t m2 = (uint32_t)(1000.0 * (denominator - (float)m1));
-    clockgen.setupMultisynth(1, SI5351_PLL_B, m1, m2, 1000);
-  } else {
-    Serial.print(F("Error: invalid fequency = "));
-    Serial.println(LOfrequency);
-  }
-}
-
 void setup(void)
 {
   pinMode(LED_PIN, OUTPUT);
@@ -342,11 +394,6 @@ void setup(void)
 
   Serial.begin(BAUDRATE);
   
-  setWordSpeed(CODE_SPEED);
-  toneFrequency = TONE_FREQ;
-  keyState = toneState = IDLE_STATE;
-  lastTone = QUIET;
-
   printVersion();
   clearBuffer();
 
@@ -364,9 +411,9 @@ void setup(void)
   // Setup PLLA to integer only mode @ 900MHz (must be 600..900MHz)
   // Set Multisynth 0 to 112.5MHz using integer only mode (div by 4/6/8)
   // 25MHz * 36 = 900 MHz, then 900 MHz / 8 = 112.5 MHz
-  Serial.println("Set PLLA to 900MHz");
+  // Serial.println("Set PLLA to 900MHz");
   clockgen.setupPLLInt(SI5351_PLL_A, 36);
-  Serial.println("Set Output #0 to 112.5MHz");
+  // Serial.println("Set Output #0 to 112.5MHz");
   clockgen.setupMultisynthInt(0, SI5351_PLL_A, SI5351_MULTISYNTH_DIV_8);
 
   // My code:
@@ -396,13 +443,18 @@ void setup(void)
   // then divide by 64 for 10.706 KHz
   // configured using either PLL in either integer or fractional mode
 
-  Serial.println("Set Output #2 to 10.706 KHz");
+  // Serial.println("Set Output #2 to 10.706 KHz");
   clockgen.setupMultisynth(2, SI5351_PLL_B, 900, 0, 1);
   clockgen.setupRdiv(2, SI5351_R_DIV_64);
 
+  setWordSpeed(CODE_SPEED);
+  toneFrequency = TONE_FREQ;
+  keyState = toneState = IDLE_STATE;
+  lastTone = QUIET;
+
   setFrequency(3.500000);
-  // Enable the clocks
-  clockgen.enableOutputs(true);
+  // Disable the clocks
+  clockgen.enableOutputs(false);
 }
 
 void printHelp() {
@@ -415,7 +467,9 @@ void printHelp() {
   Serial.println(F("  v                  Norm  Print version."));
   Serial.println(F("  h                  Norm  Print this help."));
   Serial.println(F("  f      frequency   Norm  Set fequency in megahertz."));
+  Serial.println(F("  w      speed       Norm  Set the words-per-minute speed."));
   Serial.println(F("                           Must be between 3.5 and 4.0."));
+  Serial.println(F("  k      0 | 1       Norm  Key oscillator: 0 = off, 1 = on."));
   Serial.println(F("  @                  Imed  Print device ID"));
 }
 
@@ -426,5 +480,5 @@ void loop(void)
 {
   updateKeyState();
   updateToneState(toneType);
-  updateOscillatorState();
+  updateMainState();
 }
